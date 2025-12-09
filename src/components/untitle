@@ -1,0 +1,50 @@
+-I have research and get the knowledge of
+->Library
+-face-api.js using reactjs ->no backend and runs on browser
+
+->Third party library for face recognition
+->CompreFace
+-Support everything with all frontend
+-Recommand-> Docker
+-run as a local or cloud server
+
+->Human.js
+-Runs on browser & no backend
+-Uses WebGL/WebGPU/WASM for speed
+
+Webcam/Image → Human.js → Face Detection → Face Embeddings
+↓
+Compare with Known Faces
+↓
+Recognized / Unknown
+↓
+Draw on Canvas (bounding boxes + name)
+↓
+Repeat (requestAnimationFrame for real-time)
+
+Start Webcam
+↓
+Capture Video Frame
+↓
+Human.js detect(frame)
+↓
+Get face boxes + embeddings
+↓
+Compare embeddings with knownFaces
+↓
+Assign name (recognized/unknown)
+↓
+Draw bounding box + name on canvas
+↓
+Repeat (requestAnimationFrame for real-time)
+↓
+[Optional] Add face → store embedding in knownFaces
+
+
+
+- login or face lock -> if user authenticated -> goes on next page
+            or else shows face detect
+
+
+
+            https://github.com/krishnamistry-17/Face_recognize.git
