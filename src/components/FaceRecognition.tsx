@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import Human from "@vladmandic/human";
+import { supabase } from "../lib/supabase";
 
 interface KnownFace {
   name: string;
@@ -16,9 +17,35 @@ const FaceRecognition: React.FC = () => {
   const [useBackCamera, setUseBackCamera] = useState(false);
 
   const [isWebcamRunning, setWebcamRunning] = useState(false);
+  // Liveness tracking
+  const prevBoxRef = useRef<{
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    t: number;
+  } | null>(null);
+  const liveScoreRef = useRef<number>(0);
+  // Blink/liveness using eye aspect ratio (EAR)
+  const lastBlinkAtRef = useRef<number>(0);
+  const wasEyeClosedRef = useRef<boolean>(false);
+
+  // --- Auth state (email/password + session) ---
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [currentUserEmail, setCurrentUserEmail] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [faceAuthLoading, setFaceAuthLoading] = useState(false);
+  const [embeddingFromSupabase, setEmbeddingFromSupabase] = useState<
+    number[] | null
+  >(null);
+  const [profileName, setProfileName] = useState<string | null>(null);
 
   // Matching threshold (lower distance is better)
   const MATCH_DISTANCE = 0.75;
+  // Slightly more lenient threshold for auth login flow
+  const FACE_LOGIN_MATCH_DISTANCE = 0.95;
 
   // Euclidean Distance
   const euclideanDistance = (a: number[], b: number[]) => {
@@ -46,6 +73,29 @@ const FaceRecognition: React.FC = () => {
     return { index: minIndex, distance: distances[minIndex] };
   };
 
+  // Eye Aspect Ratio helpers (MediaPipe indices)
+  const earDistance = (a: [number, number], b: [number, number]) =>
+    Math.hypot(a[0] - b[0], a[1] - b[1]);
+  const computeEAR = (mesh: Array<[number, number, number]>, idx: number[]) => {
+    // idx mapping expects 6 points: [p1, p2, p3, p4, p5, p6]
+    const p1 = mesh[idx[0]];
+    const p2 = mesh[idx[1]];
+    const p3 = mesh[idx[2]];
+    const p4 = mesh[idx[3]];
+    const p5 = mesh[idx[4]];
+    const p6 = mesh[idx[5]];
+    if (!p1 || !p2 || !p3 || !p4 || !p5 || !p6) return null;
+    const vertical1 = earDistance([p2[0], p2[1]], [p6[0], p6[1]]);
+    const vertical2 = earDistance([p3[0], p3[1]], [p5[0], p5[1]]);
+    const horizontal = earDistance([p1[0], p1[1]], [p4[0], p4[1]]);
+    if (horizontal === 0) return null;
+    return (vertical1 + vertical2) / (2.0 * horizontal);
+  };
+  const LEFT_EYE = [33, 160, 158, 133, 153, 144];
+  const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
+  const EAR_CLOSED = 0.18;
+  const EAR_OPEN = 0.25;
+
   useEffect(() => {
     const initHuman = async () => {
       const h = new Human({
@@ -53,7 +103,7 @@ const FaceRecognition: React.FC = () => {
         face: {
           enabled: true,
           detector: { enabled: true },
-          mesh: { enabled: false },
+          mesh: { enabled: true },
           description: { enabled: true }, //add description to the face and it find face in the image
         },
       });
@@ -67,6 +117,57 @@ const FaceRecognition: React.FC = () => {
     initHuman();
   }, []);
 
+  // Check auth session on mount
+  useEffect(() => {
+    const check = async () => {
+      const { data } = await supabase.auth.getSession();
+      const session = data?.session ?? null;
+      setIsLoggedIn(!!session);
+      setCurrentUserEmail(session?.user?.email ?? null);
+      if (session?.user?.email) setAuthEmail(session.user.email);
+    };
+    check();
+  }, []);
+
+  // Load face embedding for the typed email from Supabase
+  useEffect(() => {
+    const load = async () => {
+      if (!authEmail) {
+        setEmbeddingFromSupabase(null);
+        setProfileName(null);
+        return;
+      }
+      const { data } = await supabase
+        .from("face_profiles")
+        .select("embedding,name")
+        .eq("email", authEmail)
+        .maybeSingle();
+      if (data?.embedding) {
+        setEmbeddingFromSupabase(data.embedding as number[]);
+        setProfileName((data as any).name ?? authEmail);
+      } else {
+        setEmbeddingFromSupabase(null);
+        setProfileName(null);
+      }
+    };
+    load();
+  }, [authEmail]);
+
+  // If we have a profile embedding from Supabase, ensure it is part of knownFaces
+  useEffect(() => {
+    if (!embeddingFromSupabase || !authEmail) return;
+    const nameToUse = profileName || authEmail;
+    setKnownFaces((prev) => {
+      const idx = prev.findIndex((f) => f.name === nameToUse);
+      if (idx >= 0) {
+        // Update existing entry's embedding
+        const next = prev.slice();
+        next[idx] = { name: nameToUse, embedding: embeddingFromSupabase };
+        return next;
+      }
+      return [...prev, { name: nameToUse, embedding: embeddingFromSupabase }];
+    });
+  }, [embeddingFromSupabase, authEmail, profileName]);
   // Load saved known faces on mount
   useEffect(() => {
     try {
@@ -86,6 +187,316 @@ const FaceRecognition: React.FC = () => {
       localStorage.setItem("knownFaces", JSON.stringify(knownFaces));
     } catch (_e) {}
   }, [knownFaces]);
+
+  // Email/password login
+  const loginWithEmailPassword = async () => {
+    try {
+      setAuthLoading(true);
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: authEmail,
+        password: authPassword,
+      });
+      if (error) {
+        alert(error.message);
+        return;
+      }
+      setIsLoggedIn(true);
+      setCurrentUserEmail(data.user?.email ?? authEmail);
+      alert("Logged in successfully.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  // Email/password signup
+  const signupWithEmailPassword = async () => {
+    try {
+      setAuthLoading(true);
+      const { error } = await supabase.auth.signUp({
+        email: authEmail,
+        password: authPassword,
+      });
+      if (error) {
+        alert(error.message);
+        return;
+      }
+      alert(
+        "Signup successful. Please check your email to confirm your account."
+      );
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const logout = async () => {
+    await supabase.auth.signOut();
+    setIsLoggedIn(false);
+    setCurrentUserEmail(null);
+  };
+
+  // Face-based auth: if face profile exists for email, match and "log in";
+  // otherwise, enroll a new face profile for that email.
+  const loginOrEnrollWithFace = async () => {
+    if (!human) {
+      alert("Model not ready yet. Please wait and try again.");
+      return;
+    }
+    if (!videoRef.current) {
+      alert("Video not ready. Start the webcam first.");
+      return;
+    }
+    try {
+      setFaceAuthLoading(true);
+      if (!isWebcamRunning) {
+        await startWebcam();
+      }
+
+      const samples: number[][] = [];
+      const boxCenters: Array<{ cx: number; cy: number; area: number }> = [];
+      let blinked = false;
+      const maxSamples = 7;
+      const maxTries = 40;
+      let tries = 0;
+      while (samples.length < maxSamples && tries < maxTries) {
+        const result = await human.detect(videoRef.current);
+        if (result.face.length && result.face[0].embedding) {
+          samples.push(l2Normalize(result.face[0].embedding));
+          const [x, y, w, h] = result.face[0].box;
+          boxCenters.push({ cx: x + w / 2, cy: y + h / 2, area: w * h });
+          const mesh = (result.face[0] as any).mesh as
+            | Array<[number, number, number]>
+            | undefined;
+          if (mesh && Array.isArray(mesh)) {
+            const left = computeEAR(mesh, LEFT_EYE);
+            const right = computeEAR(mesh, RIGHT_EYE);
+            if (left !== null && right !== null) {
+              const ear = (left + right) / 2;
+              if (!wasEyeClosedRef.current && ear < EAR_CLOSED) {
+                wasEyeClosedRef.current = true;
+              }
+              if (wasEyeClosedRef.current && ear > EAR_OPEN) {
+                wasEyeClosedRef.current = false;
+                blinked = true;
+              }
+            }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 120));
+        tries++;
+      }
+      if (!samples.length) {
+        alert("Face not detected. Try again with better lighting.");
+        return;
+      }
+      // Liveness metrics across samples
+      let maxDist = 0;
+      let maxAreaChange = 0;
+      for (let i = 1; i < boxCenters.length; i++) {
+        const a = boxCenters[i - 1];
+        const b = boxCenters[i];
+        const dist = Math.hypot(b.cx - a.cx, b.cy - a.cy);
+        const areaChange = Math.abs(b.area - a.area) / Math.max(a.area, 1);
+        if (dist > maxDist) maxDist = dist;
+        if (areaChange > maxAreaChange) maxAreaChange = areaChange;
+      }
+      const durationMs =
+        boxCenters.length >= 2 ? (boxCenters.length - 1) * 120 : 0;
+      const movedLoose = maxDist > 3 || maxAreaChange > 0.02;
+      const movedStrict =
+        (maxDist > 4 || maxAreaChange > 0.03) && durationMs >= 600;
+      const length = samples[0].length;
+      const mean = new Array(length).fill(0);
+      for (const s of samples) {
+        for (let i = 0; i < length; i++) mean[i] += s[i];
+      }
+      for (let i = 0; i < length; i++) mean[i] /= samples.length;
+      const liveEmbedding = l2Normalize(mean);
+
+      if (embeddingFromSupabase) {
+        // Loose liveness gate for login
+        if (!movedLoose && !blinked) {
+          alert(
+            "Liveness check failed. Please move your head slightly and try again."
+          );
+          return;
+        }
+        if (embeddingFromSupabase.length !== liveEmbedding.length) {
+          alert(
+            "Your saved profile is from a different model version. Updating your face profile now."
+          );
+          const { data: userData } = await supabase.auth.getUser();
+          const user_id = userData?.user?.id ?? null;
+          await supabase.from("face_profiles").upsert(
+            {
+              user_id,
+              email: authEmail,
+              name: profileName || authEmail,
+              embedding: liveEmbedding,
+            },
+            { onConflict: "email" }
+          );
+          setEmbeddingFromSupabase(liveEmbedding);
+          alert("Face profile updated. Please try face login again.");
+          return;
+        }
+
+        const distance = euclideanDistance(
+          liveEmbedding,
+          l2Normalize(embeddingFromSupabase)
+        );
+        if (distance <= FACE_LOGIN_MATCH_DISTANCE) {
+          alert("Face matched — logging you in!");
+          window.location.href = "/welcome";
+          await supabase.auth.signInWithPassword({
+            email: authEmail,
+            password: authPassword || "anything",
+          });
+          const { data } = await supabase.auth.getSession();
+          setIsLoggedIn(!!data.session);
+          setCurrentUserEmail(authEmail);
+          return;
+        } else {
+          alert(
+            `Face does not match the saved profile (distance ${distance.toFixed(
+              3
+            )}). Try better lighting/angle or update your profile.`
+          );
+          return;
+        }
+      } else {
+        // Strict liveness gate for enrollment: require blink AND movement
+        if (!(blinked && movedStrict)) {
+          alert(
+            "Liveness check failed for enrollment. Please blink AND move your head slightly, then try again."
+          );
+          return;
+        }
+        if (!authEmail) {
+          alert("Enter your email before enrolling your face.");
+          return;
+        }
+
+        const { data: userData } = await supabase.auth.getUser();
+        const user_id = userData?.user?.id ?? null;
+        await supabase.from("face_profiles").upsert(
+          {
+            user_id,
+            email: authEmail,
+            name: authEmail,
+            embedding: liveEmbedding,
+          },
+          { onConflict: "email" }
+        );
+        setEmbeddingFromSupabase(liveEmbedding);
+        alert("Face enrolled successfully for this email.");
+      }
+    } finally {
+      setFaceAuthLoading(false);
+    }
+  };
+
+  // Explicitly update/overwrite the face profile for current email
+  const updateFaceProfile = async () => {
+    if (!human) {
+      alert("Model not ready yet. Please wait and try again.");
+      return;
+    }
+    if (!videoRef.current) {
+      alert("Video not ready. Start the webcam first.");
+      return;
+    }
+    if (!authEmail) {
+      alert("Enter your email before updating your face profile.");
+      return;
+    }
+    try {
+      if (!isWebcamRunning) {
+        await startWebcam();
+      }
+      const samples: number[][] = [];
+      const boxCenters: Array<{ cx: number; cy: number; area: number }> = [];
+      let blinked = false;
+      const maxSamples = 7;
+      const maxTries = 40;
+      let tries = 0;
+      while (samples.length < maxSamples && tries < maxTries) {
+        const result = await human.detect(videoRef.current);
+        if (result.face.length && result.face[0].embedding) {
+          samples.push(l2Normalize(result.face[0].embedding));
+          const [x, y, w, h] = result.face[0].box;
+          boxCenters.push({ cx: x + w / 2, cy: y + h / 2, area: w * h });
+          const mesh = (result.face[0] as any).mesh as
+            | Array<[number, number, number]>
+            | undefined;
+          if (mesh && Array.isArray(mesh)) {
+            const left = computeEAR(mesh, LEFT_EYE);
+            const right = computeEAR(mesh, RIGHT_EYE);
+            if (left !== null && right !== null) {
+              const ear = (left + right) / 2;
+              if (!wasEyeClosedRef.current && ear < EAR_CLOSED) {
+                wasEyeClosedRef.current = true;
+              }
+              if (wasEyeClosedRef.current && ear > EAR_OPEN) {
+                wasEyeClosedRef.current = false;
+                blinked = true;
+              }
+            }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 120));
+        tries++;
+      }
+      if (!samples.length) {
+        alert("Face not detected. Try again with better lighting.");
+        return;
+      }
+      // Strict liveness gate for profile update
+      let maxDist = 0;
+      let maxAreaChange = 0;
+      for (let i = 1; i < boxCenters.length; i++) {
+        const a = boxCenters[i - 1];
+        const b = boxCenters[i];
+        const dist = Math.hypot(b.cx - a.cx, b.cy - a.cy);
+        const areaChange = Math.abs(b.area - a.area) / Math.max(a.area, 1);
+        if (dist > maxDist) maxDist = dist;
+        if (areaChange > maxAreaChange) maxAreaChange = areaChange;
+      }
+      const durationMs =
+        boxCenters.length >= 2 ? (boxCenters.length - 1) * 120 : 0;
+      const movedStrict =
+        (maxDist > 4 || maxAreaChange > 0.03) && durationMs >= 600;
+      // Strict liveness for update: require blink AND movement
+      if (!(blinked && movedStrict)) {
+        alert(
+          "Liveness check failed for update. Please blink AND move your head slightly, then try again."
+        );
+        return;
+      }
+      const length = samples[0].length;
+      const mean = new Array(length).fill(0);
+      for (const s of samples) {
+        for (let i = 0; i < length; i++) mean[i] += s[i];
+      }
+      for (let i = 0; i < length; i++) mean[i] /= samples.length;
+      const liveEmbedding = l2Normalize(mean);
+
+      const { data: userData } = await supabase.auth.getUser();
+      const user_id = userData?.user?.id ?? null;
+      await supabase.from("face_profiles").upsert(
+        {
+          user_id,
+          email: authEmail,
+          name: profileName || authEmail,
+          embedding: liveEmbedding,
+        },
+        { onConflict: "email" }
+      );
+      setEmbeddingFromSupabase(liveEmbedding);
+      alert("Face profile updated successfully.");
+    } catch (_e) {
+      alert("Failed to update face profile. Please try again.");
+    }
+  };
 
   const startWebcam = async () => {
     try {
@@ -174,6 +585,51 @@ const FaceRecognition: React.FC = () => {
         // Draw faces
         result.face.forEach((face) => {
           if (!face.embedding) return;
+          // Basic liveness estimation using box motion/scale change over frames
+          const [x, y, w, h] = face.box;
+          const cx = x + w / 2;
+          const cy = y + h / 2;
+          const area = w * h;
+          // Blink detection using eye aspect ratio if mesh present
+          if ((face as any).mesh && Array.isArray((face as any).mesh)) {
+            const mesh = (face as any).mesh as Array<[number, number, number]>;
+            const left = computeEAR(mesh, LEFT_EYE);
+            const right = computeEAR(mesh, RIGHT_EYE);
+            if (left !== null && right !== null) {
+              const ear = (left + right) / 2;
+              if (!wasEyeClosedRef.current && ear < EAR_CLOSED) {
+                wasEyeClosedRef.current = true;
+              }
+              if (wasEyeClosedRef.current && ear > EAR_OPEN) {
+                wasEyeClosedRef.current = false;
+                lastBlinkAtRef.current = performance.now();
+              }
+            }
+          }
+          if (prevBoxRef.current) {
+            const pcx = prevBoxRef.current.x + prevBoxRef.current.w / 2;
+            const pcy = prevBoxRef.current.y + prevBoxRef.current.h / 2;
+            const parea = prevBoxRef.current.w * prevBoxRef.current.h;
+            const dist = Math.hypot(cx - pcx, cy - pcy);
+            const areaChange = Math.abs(area - parea) / Math.max(parea, 1);
+            let inc = 0;
+            if (dist > 3) inc += 1; // minimal head movement
+            if (areaChange > 0.02) inc += 1; // >2% scale change
+            liveScoreRef.current = Math.max(
+              0,
+              Math.min(5, liveScoreRef.current * 0.9 + inc)
+            );
+          }
+          prevBoxRef.current = { x, y, w, h, t: performance.now() };
+          const isLive = liveScoreRef.current >= 1.5;
+          const blinkRecent =
+            performance.now() - (lastBlinkAtRef.current || 0) < 4000;
+
+          if (!isLive || !blinkRecent) {
+            // Skip labeling/static image detections
+            return;
+          }
+
           let name = "Unknown";
           const entries = knownFaces.filter(
             (k) => k.embedding && k.embedding.length === face.embedding!.length
@@ -186,7 +642,6 @@ const FaceRecognition: React.FC = () => {
             }
           }
 
-          const [x, y, w, h] = face.box;
           // Box
           draw.strokeStyle = "lime";
           draw.lineWidth = 2;
@@ -243,6 +698,91 @@ const FaceRecognition: React.FC = () => {
 
   return (
     <div className="mx-auto w-full max-w-5xl px-4 sm:px-6 lg:px-8 py-6 ">
+      {/* Auth controls (email/password + face) */}
+      <div className="mb-6 border rounded-md p-4">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+          <div className="flex-1">
+            <h3 className="text-lg font-semibold">Authentication</h3>
+            <p className="text-sm text-gray-600">
+              {isLoggedIn ? (
+                <>
+                  Logged in as{" "}
+                  <span className="font-medium">{currentUserEmail}</span>
+                </>
+              ) : (
+                "Not authenticated"
+              )}
+            </p>
+          </div>
+          {isLoggedIn ? (
+            <button
+              onClick={logout}
+              className="bg-gray-200 hover:bg-gray-300 transition-colors px-3 py-2 rounded-md text-sm"
+            >
+              Logout
+            </button>
+          ) : null}
+        </div>
+
+        {!isLoggedIn && (
+          <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+            <input
+              className="rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:outline-none focus:ring-0"
+              type="email"
+              placeholder="Email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+            />
+            <input
+              className="rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:outline-none focus:ring-0"
+              type="password"
+              placeholder="Password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={loginWithEmailPassword}
+                disabled={authLoading}
+                className="flex-1 rounded-md bg-blue-600 px-3 py-2 text-white hover:bg-blue-700 transition-colors disabled:opacity-60"
+              >
+                {authLoading ? "..." : "Login"}
+              </button>
+              <button
+                onClick={signupWithEmailPassword}
+                disabled={authLoading}
+                className="flex-1 rounded-md bg-green-600 px-3 py-2 text-white hover:bg-green-700 transition-colors disabled:opacity-60"
+              >
+                {authLoading ? "..." : "Signup"}
+              </button>
+            </div>
+            <div className="md:col-span-3">
+              <button
+                onClick={loginOrEnrollWithFace}
+                disabled={faceAuthLoading}
+                className="w-full rounded-md bg-gray-800 px-3 py-2 text-white hover:bg-gray-900 transition-colors disabled:opacity-60"
+              >
+                {faceAuthLoading
+                  ? "Scanning face..."
+                  : "Login with Face (or Enroll if new)"}
+              </button>
+              <p className="text-xs text-gray-500 mt-1">
+                Ensure the webcam is started for face login. If no profile
+                exists for the entered email, your face will be enrolled.
+              </p>
+              <div className="mt-2 flex gap-2">
+                <button
+                  onClick={updateFaceProfile}
+                  className="rounded-md bg-gray-200 px-3 py-1 text-xs hover:bg-gray-300 transition-colors"
+                >
+                  Update Face Profile for this email
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
       <div className="mb-6">
         <h2 className="text-2xl sm:text-3xl font-bold text-blue-600">
           Live Face Recognition
