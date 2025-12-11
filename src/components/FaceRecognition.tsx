@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import Human from "@vladmandic/human";
 import { supabase } from "../lib/supabase";
-
+import Spinner from "./Spinner";
+import { FaEye, FaEyeSlash } from "react-icons/fa";
 interface KnownFace {
   name: string;
   embedding: number[];
@@ -15,8 +16,10 @@ const FaceRecognition: React.FC = () => {
   const [knownFaces, setKnownFaces] = useState<KnownFace[]>([]);
   const [newFaceName, setNewFaceName] = useState("");
   const [useBackCamera, setUseBackCamera] = useState(false);
+  const [passwordToggle, setPasswordToggle] = useState(false);
 
   const [isWebcamRunning, setWebcamRunning] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   // Liveness tracking
   const prevBoxRef = useRef<{
     x: number;
@@ -41,7 +44,7 @@ const FaceRecognition: React.FC = () => {
     number[] | null
   >(null);
   const [profileName, setProfileName] = useState<string | null>(null);
-
+  const [uploading, setUploading] = useState(false);
   // Matching threshold (lower distance is better)
   const MATCH_DISTANCE = 0.75;
   // Slightly more lenient threshold for auth login flow
@@ -91,6 +94,7 @@ const FaceRecognition: React.FC = () => {
     if (horizontal === 0) return null;
     return (vertical1 + vertical2) / (2.0 * horizontal);
   };
+
   const LEFT_EYE = [33, 160, 158, 133, 153, 144];
   const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
   const EAR_CLOSED = 0.18;
@@ -176,16 +180,18 @@ const FaceRecognition: React.FC = () => {
         const parsed = JSON.parse(saved) as KnownFace[];
         if (Array.isArray(parsed)) setKnownFaces(parsed);
       }
-      console.log("knownFaces", knownFaces);
-      console.log("saved", saved);
-    } catch (_e) {}
+    } catch (_e) {
+      console.error("Error loading known faces:", _e);
+    }
   }, []);
 
   // Persist known faces whenever they change
   useEffect(() => {
     try {
       localStorage.setItem("knownFaces", JSON.stringify(knownFaces));
-    } catch (_e) {}
+    } catch (_e) {
+      console.error("Error persisting known faces:", _e);
+    }
   }, [knownFaces]);
 
   // Email/password login
@@ -212,7 +218,7 @@ const FaceRecognition: React.FC = () => {
   const signupWithEmailPassword = async () => {
     try {
       setAuthLoading(true);
-      const { error } = await supabase.auth.signUp({
+      const { data, error } = await supabase.auth.signUp({
         email: authEmail,
         password: authPassword,
       });
@@ -220,9 +226,10 @@ const FaceRecognition: React.FC = () => {
         alert(error.message);
         return;
       }
-      alert(
-        "Signup successful. Please check your email to confirm your account."
-      );
+      if (data?.session) {
+        setCurrentUserEmail(data?.user?.email ?? null);
+        alert("Signup successful.");
+      }
     } finally {
       setAuthLoading(false);
     }
@@ -378,12 +385,17 @@ const FaceRecognition: React.FC = () => {
 
         const { data: userData } = await supabase.auth.getUser();
         const user_id = userData?.user?.id ?? null;
+        const file = fileInputRef.current?.files?.[0];
+        if (!file) return;
+        const imagePath = await uploadToFacesBucket(file, authEmail);
+        if (!imagePath) return;
         await supabase.from("face_profiles").upsert(
           {
             user_id,
             email: authEmail,
             name: authEmail,
             embedding: liveEmbedding,
+            image_path: imagePath,
           },
           { onConflict: "email" }
         );
@@ -551,7 +563,6 @@ const FaceRecognition: React.FC = () => {
   const pauseWebcam = () => {
     videoRef.current?.pause();
     setWebcamRunning(false);
-    console.log("Webcam paused");
   };
 
   const stopWebcam = () => {
@@ -559,7 +570,6 @@ const FaceRecognition: React.FC = () => {
     if (stream) stream.getTracks().forEach((t) => t.stop());
     videoRef.current!.srcObject = null;
     setWebcamRunning(false);
-    console.log("Webcam stopped");
   };
 
   useEffect(() => {
@@ -696,8 +706,104 @@ const FaceRecognition: React.FC = () => {
     setNewFaceName("");
   };
 
+  //upload to face bucket
+  const uploadToFacesBucket = async (
+    file: Blob,
+    email: string
+  ): Promise<string | null> => {
+    try {
+      const safeDir = (email || "anonymous").replace(/[^a-zA-Z0-9@._-]/g, "_");
+      const filePath = `${safeDir}/${Date.now()}.jpg`;
+      const { error } = await supabase.storage
+        .from("faces")
+        .upload(filePath, file, {
+          contentType: "image/jpeg",
+          upsert: true,
+        });
+      if (error) {
+        console.error("Storage upload error:", error);
+        alert(`Storage upload failed: ${error.message}`);
+        return null;
+      }
+      return filePath;
+    } catch (e) {
+      console.error("uploadToFacesBucket failed:", e);
+      return null;
+    }
+  };
+
+  //upload test
+  const handleTestUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    try {
+      setUploading(true);
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file) return;
+      if (!human) {
+        alert("Model not ready yet. Please wait and try again.");
+        return;
+      }
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      await new Promise((res, rej) => {
+        img.onload = () => res(null);
+        img.onerror = () => rej(new Error("Failed to load image"));
+      });
+      const result = await human.detect(img as HTMLImageElement);
+      if (!result.face.length || !result.face[0].embedding) {
+        alert("No face detected in the uploaded image.");
+        return;
+      }
+      const embedding = l2Normalize(result.face[0].embedding);
+
+      if (embeddingFromSupabase) {
+        const distance = euclideanDistance(
+          embedding,
+          l2Normalize(embeddingFromSupabase)
+        );
+        alert(
+          distance <= FACE_LOGIN_MATCH_DISTANCE
+            ? `Match (distance ${distance.toFixed(3)})`
+            : `Not a match (distance ${distance.toFixed(3)})`
+        );
+        return;
+      }
+
+      if (!isLoggedIn || !authEmail) {
+        alert("Please login first, then upload an image to enroll.");
+        return;
+      }
+
+      const { data: userData } = await supabase.auth.getUser();
+      const user_id = userData?.user?.id ?? null;
+      // Upload original file to Storage to get required image_path
+      const imagePath = await uploadToFacesBucket(file, authEmail);
+      if (!imagePath) return;
+      const { error: upErr } = await supabase.from("face_profiles").upsert(
+        {
+          user_id,
+          email: authEmail,
+          name: profileName || authEmail,
+          embedding,
+          image_path: imagePath,
+        },
+        { onConflict: "email" }
+      );
+      if (upErr) {
+        alert(`Failed to enroll face profile: ${upErr.message}`);
+        return;
+      }
+      setEmbeddingFromSupabase(embedding);
+      alert("Face enrolled successfully from uploaded image.");
+      setUploading(false);
+    } catch (_e) {
+      alert("Failed to process uploaded image.");
+      setUploading(false);
+    }
+  };
+
   return (
-    <div className="mx-auto w-full max-w-5xl px-4 sm:px-6 lg:px-8 py-6 ">
+    <div className="mx-auto w-full max-w-2xl px-4 sm:px-6 lg:px-8 py-6 ">
       {/* Auth controls (email/password + face) */}
       <div className="mb-6 border rounded-md p-4">
         <div className="flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
@@ -713,6 +819,31 @@ const FaceRecognition: React.FC = () => {
                 "Not authenticated"
               )}
             </p>
+            {isLoggedIn && (
+              <div className="mt-2 flex items-center gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={handleTestUpload}
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="rounded-md bg-gray-200 px-3 py-1 text-xs hover:bg-gray-300 transition-colors disabled:opacity-60"
+                  disabled={uploading}
+                >
+                  {uploading ? (
+                    <Spinner size={16} className=" animate-spin text-red-600" />
+                  ) : (
+                    "Upload face image (test)"
+                  )}
+                </button>
+                <span className="text-xs text-gray-500">
+                  Enrolls if no profile; otherwise tries to match.
+                </span>
+              </div>
+            )}
           </div>
           {isLoggedIn ? (
             <button
@@ -733,13 +864,21 @@ const FaceRecognition: React.FC = () => {
               value={authEmail}
               onChange={(e) => setAuthEmail(e.target.value)}
             />
-            <input
-              className="rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:outline-none focus:ring-0"
-              type="password"
-              placeholder="Password"
-              value={authPassword}
-              onChange={(e) => setAuthPassword(e.target.value)}
-            />
+            <div className="rounded-md border border-gray-300 px-3 py-2 shadow-sm focus:outline-none focus:ring-0 flex justify-between items-center">
+              <input
+                type={passwordToggle ? "text" : "password"}
+                className="w-full focus:outline-none focus:ring-0"
+                placeholder="Password"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+              />
+              <button
+                onClick={() => setPasswordToggle(!passwordToggle)}
+                className="text-gray-500 hover:text-gray-700 cursor-pointer justify-end "
+              >
+                {!passwordToggle ? <FaEyeSlash /> : <FaEye />}
+              </button>
+            </div>
             <div className="flex gap-2">
               <button
                 onClick={loginWithEmailPassword}
@@ -782,106 +921,113 @@ const FaceRecognition: React.FC = () => {
           </div>
         )}
       </div>
-
-      <div className="mb-6">
-        <h2 className="text-2xl sm:text-3xl font-bold text-blue-600">
-          Live Face Recognition
-        </h2>
-        <p className="mt-1 text-sm text-gray-600">
-          Status:{" "}
-          <span className={isWebcamRunning ? "text-green-600" : "text-red-600"}>
-            {isWebcamRunning ? "Webcam is running" : "Webcam is not running"}
-          </span>
-        </p>
-      </div>
-
-      {/* Controls */}
-      <div className="flex flex-wrap items-center gap-3 mb-6">
-        <button
-          className={`px-4 py-2 rounded-md text-white transition-colors ${
-            isWebcamRunning
-              ? "bg-green-600 hover:bg-green-700"
-              : "bg-blue-600 hover:bg-blue-700"
-          }`}
-          onClick={startWebcam}
-        >
-          Start Webcam
-        </button>
-
-        <button
-          className="bg-yellow-500 text-white px-4 py-2 rounded-md hover:bg-yellow-600 transition-colors"
-          onClick={pauseWebcam}
-        >
-          Pause Webcam
-        </button>
-        <button
-          className="bg-red-500 text-white px-4 py-2 rounded-md hover:bg-red-600 transition-colors"
-          onClick={stopWebcam}
-        >
-          Stop Webcam
-        </button>
-
-        <label className=" gap-2 ml-auto inline-flex items-center">
-          <input
-            type="checkbox"
-            className="h-4 w-4"
-            checked={useBackCamera}
-            onChange={(e) => setUseBackCamera(e.target.checked)}
-          />
-          Use back camera
-        </label>
-      </div>
-
-      {/* Video + Canvas */}
-      <div className="relative border-2 border-gray-600 rounded mb-6">
-        <video
-          ref={videoRef}
-          width={640}
-          height={480}
-          className="rounded"
-          autoPlay
-          muted
-          playsInline
-        />
-        <canvas ref={canvasRef} className="absolute top-0 left-0" />
-      </div>
-
-      {/* Add Face */}
-      <div className="mt-4 flex gap-2 mb-6 flex-col sm:flex-row items-stretch sm:items-center">
-        <input
-          className="w-full sm:w-auto flex-1 rounded-md border border-gray-300
-           px-3 py-2 shadow-sm  focus:outline-none focus:ring-0"
-          type="text"
-          placeholder="Enter name"
-          value={newFaceName}
-          onChange={(e) => setNewFaceName(e.target.value)}
-        />
-        <button
-          className="w-full sm:w-auto rounded-md bg-green-600 px-4 py-2 text-white hover:bg-green-700 transition-colors"
-          onClick={addFace}
-        >
-          Add Face
-        </button>
-      </div>
-
-      {/* Known Faces */}
-      <div>
-        <h3 className="mb-3 text-lg font-semibold">Known Faces</h3>
-        {knownFaces.length === 0 ? (
-          <p className="text-sm text-gray-500">No faces saved yet.</p>
-        ) : (
-          <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
-            {knownFaces.map((f) => (
-              <li
-                key={f.name}
-                className="rounded-full bg-gray-100 px-3 py-1 text-sm text-gray-800"
+      {!isLoggedIn && (
+        <>
+          <div className="mb-6">
+            <h2 className="text-2xl sm:text-3xl font-bold text-blue-600">
+              Live Face Recognition
+            </h2>
+            <p className="mt-1 text-sm text-gray-600">
+              Status:{" "}
+              <span
+                className={isWebcamRunning ? "text-green-600" : "text-red-600"}
               >
-                {f.name}
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
+                {isWebcamRunning
+                  ? "Webcam is running"
+                  : "Webcam is not running"}
+              </span>
+            </p>
+          </div>
+
+          {/* Controls */}
+          <div className="flex flex-wrap items-center gap-3 mb-6">
+            <button
+              className={`px-4 py-2 rounded-md text-white transition-colors ${
+                isWebcamRunning
+                  ? "bg-green-600 hover:bg-green-700"
+                  : "bg-blue-600 hover:bg-blue-700"
+              }`}
+              onClick={startWebcam}
+            >
+              Start Webcam
+            </button>
+
+            <button
+              className="bg-yellow-500 text-white px-4 py-2 rounded-md hover:bg-yellow-600 transition-colors"
+              onClick={pauseWebcam}
+            >
+              Pause Webcam
+            </button>
+            <button
+              className="bg-red-500 text-white px-4 py-2 rounded-md hover:bg-red-600 transition-colors"
+              onClick={stopWebcam}
+            >
+              Stop Webcam
+            </button>
+
+            <label className=" gap-2 ml-auto inline-flex items-center">
+              <input
+                type="checkbox"
+                className="h-4 w-4"
+                checked={useBackCamera}
+                onChange={(e) => setUseBackCamera(e.target.checked)}
+              />
+              Use back camera
+            </label>
+          </div>
+
+          {/* Video + Canvas */}
+          <div className="relative border-2 border-gray-600 rounded mb-6">
+            <video
+              ref={videoRef}
+              width={640}
+              height={480}
+              className="rounded"
+              autoPlay
+              muted
+              playsInline
+            />
+            <canvas ref={canvasRef} className="absolute top-0 left-0" />
+          </div>
+
+          {/* Add Face */}
+          <div className="mt-4 flex gap-2 mb-6 flex-col sm:flex-row items-stretch sm:items-center">
+            <input
+              className="w-full sm:w-auto flex-1 rounded-md border border-gray-300
+           px-3 py-2 shadow-sm  focus:outline-none focus:ring-0"
+              type="text"
+              placeholder="Enter name"
+              value={newFaceName}
+              onChange={(e) => setNewFaceName(e.target.value)}
+            />
+            <button
+              className="w-full sm:w-auto rounded-md bg-green-600 px-4 py-2 text-white hover:bg-green-700 transition-colors"
+              onClick={addFace}
+            >
+              Add Face
+            </button>
+          </div>
+
+          {/* Known Faces */}
+          <div>
+            <h3 className="mb-3 text-lg font-semibold">Known Faces</h3>
+            {knownFaces.length === 0 ? (
+              <p className="text-sm text-gray-500">No faces saved yet.</p>
+            ) : (
+              <ul className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                {knownFaces.map((f) => (
+                  <li
+                    key={f.name}
+                    className="rounded-full bg-gray-100 px-3 py-1 text-sm text-gray-800"
+                  >
+                    {f.name}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 };

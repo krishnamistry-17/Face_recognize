@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 const Navbar = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  console.log("isLoggedIn", isLoggedIn);
+
   const navigate = useNavigate();
   const handleLogout = async () => {
     await supabase.auth.signOut();

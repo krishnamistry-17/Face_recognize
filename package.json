@@ -2,17 +2,13 @@
   "name": "human-face-ts",
   "version": "0.1.0",
   "private": true,
-  "dependencies": {
+  "dependencies": { 
     "@supabase/supabase-js": "^2.87.0",
     "@tailwindcss/vite": "^4.1.17",
-    "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
-    "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^13.5.0",
     "@types/jest": "^27.5.2",
     "@types/node": "^18.19.0",
-    "@types/react": "^19.2.7",
-    "@types/react-dom": "^19.2.3",
     "@vladmandic/human": "^3.3.6",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
@@ -29,7 +25,8 @@
     "eject": "react-scripts eject",
     "dev": "vite --host",
     "build:vite": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:coverage": "react-scripts test --coverage"
   },
   "eslintConfig": {
     "extends": [
@@ -51,6 +48,10 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.0",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.0",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react-swc": "^3.7.0",
     "autoprefixer": "^10.4.22",
     "postcss": "^8.5.6",
